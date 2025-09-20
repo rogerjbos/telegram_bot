@@ -1,1 +1,0 @@
-/Users/rogerbos/rust_home/telegram-bot/target/debug/libtelegram_bot.rlib: /Users/rogerbos/rust_home/telegram-bot/src/bot.rs /Users/rogerbos/rust_home/telegram-bot/src/error.rs /Users/rogerbos/rust_home/telegram-bot/src/lib.rs /Users/rogerbos/rust_home/telegram-bot/src/traits.rs
