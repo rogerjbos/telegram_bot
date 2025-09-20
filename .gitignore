@@ -1,0 +1,20 @@
+# Ignore build artifacts
+/target/
+
+# Ignore environment files
+.env
+
+# Ignore lock files for libraries
+Cargo.lock
+
+# Ignore VS Code settings folder
+.vscode/
+
+# Ignore OS generated files
+env.example
+debug.log
+.DS_Store
+
+# Misc
+*.log
+**/*.rs.bk
