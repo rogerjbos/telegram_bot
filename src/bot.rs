@@ -6,7 +6,15 @@ use teloxide::{
     types::{ChatId, ParseMode},
     utils::command::BotCommands,
 };
-use tokio::{sync::Mutex, time::Duration};
+use tokio::{
+    sync::{mpsc, oneshot, Mutex},
+    time::Duration,
+};
+
+/// Requests that can be sent to the live trading bot runner.
+pub enum BotRequest {
+    GetStatus(oneshot::Sender<Result<String, String>>),
+}
 
 use crate::{
     error::BotError,
@@ -17,6 +25,8 @@ use crate::{
 pub struct BotState {
     pub is_running: bool,
     pub notification_level: NotificationLevel,
+    pub config_path: Option<String>,
+    pub interval_seconds: Option<u64>,
 }
 
 /// Notification levels for the Telegram bot
@@ -39,6 +49,8 @@ impl Default for BotState {
         Self {
             is_running: false,
             notification_level: NotificationLevel::Important,
+            config_path: None,
+            interval_seconds: None,
         }
     }
 }
@@ -69,17 +81,24 @@ pub enum Command {
     RemoveSymbol(String),
 }
 
-pub struct TelegramBotHandler<T: TradingBot> {
-    trading_bot: Option<T>,
-    config_path: String,
+pub struct TelegramBotHandler {
+    request_tx: mpsc::UnboundedSender<BotRequest>,
 }
 
-impl<T: TradingBot> TelegramBotHandler<T> {
-    pub fn new(config_path: String) -> Self {
-        Self {
-            trading_bot: None,
-            config_path,
-        }
+impl TelegramBotHandler {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<BotRequest>) {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        (Self { request_tx }, request_rx)
+    }
+
+    async fn request_status(&self) -> Result<String, String> {
+        let (tx, rx) = oneshot::channel();
+        self.request_tx
+            .send(BotRequest::GetStatus(tx))
+            .map_err(|_| "Bot runner unavailable".to_string())?;
+
+        rx.await
+            .map_err(|_| "Bot runner dropped status channel".to_string())?
     }
 
     /// Handle incoming Telegram commands
@@ -101,28 +120,8 @@ impl<T: TradingBot> TelegramBotHandler<T> {
                     state.is_running = true;
                     drop(state);
 
-                    // Initialize trading bot if needed
-                    if self.trading_bot.is_none() {
-                        match T::new().await {
-                            Ok(trading_bot) => {
-                                self.trading_bot = Some(trading_bot);
-                                bot.send_message(msg.chat.id, "Trading bot started successfully!")
-                                    .await?;
-                            }
-                            Err(e) => {
-                                let mut state = bot_state.lock().await;
-                                state.is_running = false;
-                                bot.send_message(
-                                    msg.chat.id,
-                                    format!("Failed to start bot: {}", e),
-                                )
-                                .await?;
-                            }
-                        }
-                    } else {
-                        bot.send_message(msg.chat.id, "Trading bot started!")
-                            .await?;
-                    }
+                    bot.send_message(msg.chat.id, "Trading bot started!")
+                        .await?;
                 } else {
                     bot.send_message(msg.chat.id, "Bot is already running.")
                         .await?;
@@ -139,24 +138,26 @@ impl<T: TradingBot> TelegramBotHandler<T> {
                 }
             }
             Command::Status => {
-                let state = bot_state.lock().await;
-                let status_msg = if state.is_running {
-                    if let Some(ref trading_bot) = self.trading_bot {
-                        format!(
+                let (is_running, notification_level) = {
+                    let state = bot_state.lock().await;
+                    (state.is_running, state.notification_level.clone())
+                };
+
+                let status_msg = if is_running {
+                    match self.request_status().await {
+                        Ok(status) => format!(
                             "Bot is running.\nNotification level: {:?}\n\n{}",
-                            state.notification_level,
-                            trading_bot.get_status().await
-                        )
-                    } else {
-                        format!(
-                            "Bot is running but not initialized.\nNotification level: {:?}",
-                            state.notification_level
-                        )
+                            notification_level, status
+                        ),
+                        Err(err) => format!(
+                            "Bot is running, but failed to retrieve status: {}",
+                            err
+                        ),
                     }
                 } else {
                     format!(
                         "Bot is stopped.\nNotification level: {:?}",
-                        state.notification_level
+                        notification_level
                     )
                 };
                 bot.send_message(msg.chat.id, status_msg).await?;
@@ -194,22 +195,33 @@ impl<T: TradingBot> TelegramBotHandler<T> {
                 }
             }
             Command::AddSymbol(data) => {
-                self.handle_add_symbol(&bot, msg.chat.id, data).await?;
+                self.handle_add_symbol(&bot, msg.chat.id, data, Arc::clone(&bot_state))
+                    .await?;
             }
             Command::RemoveSymbol(symbol) => {
-                self.handle_remove_symbol(&bot, msg.chat.id, symbol).await?;
+                self.handle_remove_symbol(&bot, msg.chat.id, symbol, Arc::clone(&bot_state))
+                    .await?;
             }
             Command::Symbols => {
-                self.handle_show_symbols(&bot, msg.chat.id).await?;
+                self.handle_show_symbols(&bot, msg.chat.id, Arc::clone(&bot_state))
+                    .await?;
             }
             Command::Update => {
-                if let Some(ref trading_bot) = self.trading_bot {
-                    let status = trading_bot.get_status().await;
-                    bot.send_message(msg.chat.id, format!("Current status:\n{}", status))
+                match self.request_status().await {
+                    Ok(status) => {
+                        bot.send_message(msg.chat.id, format!("Current status:\n{}", status))
+                            .await?;
+                    }
+                    Err(err) => {
+                        bot.send_message(
+                            msg.chat.id,
+                            format!(
+                                "Unable to retrieve status from running bot: {}",
+                                err
+                            ),
+                        )
                         .await?;
-                } else {
-                    bot.send_message(msg.chat.id, "Trading bot is not initialized.")
-                        .await?;
+                    }
                 }
             }
         }
@@ -222,6 +234,7 @@ impl<T: TradingBot> TelegramBotHandler<T> {
         bot: &Bot,
         chat_id: ChatId,
         data: String,
+        bot_state: Arc<Mutex<BotState>>,
     ) -> ResponseResult<()> {
         let parts: Vec<&str> = data.split(',').collect();
         if parts.len() != 5 {
@@ -240,7 +253,17 @@ impl<T: TradingBot> TelegramBotHandler<T> {
         let entry_threshold: f64 = parts[3].trim().parse().unwrap_or(0.0);
         let exit_threshold: f64 = parts[4].trim().parse().unwrap_or(0.0);
 
-        let config_path = PathBuf::from(&self.config_path);
+        let config_path = match bot_state.lock().await.config_path.clone() {
+            Some(path) => PathBuf::from(path),
+            None => {
+                bot.send_message(
+                    chat_id,
+                    "Configuration path is not set. Use /startbot first to initialize.",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         // Read the current file content
         let file_content = tokio::fs::read_to_string(config_path.clone()).await;
@@ -296,8 +319,19 @@ impl<T: TradingBot> TelegramBotHandler<T> {
         bot: &Bot,
         chat_id: ChatId,
         symbol: String,
+        bot_state: Arc<Mutex<BotState>>,
     ) -> ResponseResult<()> {
-        let config_path = PathBuf::from(&self.config_path);
+        let config_path = match bot_state.lock().await.config_path.clone() {
+            Some(path) => PathBuf::from(path),
+            None => {
+                bot.send_message(
+                    chat_id,
+                    "Configuration path is not set. Use /startbot first to initialize.",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         // Read the current file content
         let file_content = tokio::fs::read_to_string(config_path.clone()).await;
@@ -351,8 +385,23 @@ impl<T: TradingBot> TelegramBotHandler<T> {
         Ok(())
     }
 
-    async fn handle_show_symbols(&self, bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
-        let config_path = PathBuf::from(&self.config_path);
+    async fn handle_show_symbols(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        bot_state: Arc<Mutex<BotState>>,
+    ) -> ResponseResult<()> {
+        let config_path = match bot_state.lock().await.config_path.clone() {
+            Some(path) => PathBuf::from(path),
+            None => {
+                bot.send_message(
+                    chat_id,
+                    "Configuration path is not set. Use /startbot first to initialize.",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         // Read the file
         let file_content = tokio::fs::read_to_string(config_path).await;
@@ -411,11 +460,11 @@ impl<T: TradingBot> TelegramBotHandler<T> {
     }
 
     /// Initialize and run the trading bot in a separate thread
-    pub async fn init_and_run_bot(
+    pub async fn init_and_run_bot<T: TradingBot>(
         bot_state: Arc<Mutex<BotState>>,
         bot: Bot,
         chat_id: ChatId,
-        interval_seconds: u64,
+        mut request_rx: mpsc::UnboundedReceiver<BotRequest>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Spawn the bot in a new thread to avoid Send issues
         std::thread::spawn(move || {
@@ -423,12 +472,21 @@ impl<T: TradingBot> TelegramBotHandler<T> {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(async {
+                .block_on(async move {
                     // Try to initialize the bot
                     let init_result = T::new().await;
 
                     match init_result {
                         Ok(mut trading_bot) => {
+                            let interval_seconds = trading_bot.get_interval_seconds();
+                            let config_path = trading_bot.get_config_path().to_string();
+
+                            {
+                                let mut state = bot_state.lock().await;
+                                state.config_path = Some(config_path);
+                                state.interval_seconds = Some(interval_seconds);
+                            }
+
                             // Send confirmation message
                             if let Err(e) = bot
                                 .send_message(
@@ -447,132 +505,141 @@ impl<T: TradingBot> TelegramBotHandler<T> {
                             check_interval.tick().await;
 
                             loop {
-                                // Check if we should stop
-                                let should_run = {
-                                    let state = bot_state.lock().await;
-                                    state.is_running
-                                };
-
-                                if !should_run {
-                                    println!("Stop flag detected, shutting down bot");
-                                    if let Err(e) = bot
-                                        .send_message(chat_id, "Trading bot has been stopped.")
-                                        .await
-                                    {
-                                        eprintln!("Error sending stop message: {}", e);
+                                tokio::select! {
+                                    maybe_request = request_rx.recv() => {
+                                        match maybe_request {
+                                            Some(BotRequest::GetStatus(response_tx)) => {
+                                                let status = trading_bot.get_status().await;
+                                                let _ = response_tx.send(Ok(status));
+                                            }
+                                            None => {
+                                                println!("Request channel closed, shutting down bot runner");
+                                                break;
+                                            }
+                                        }
                                     }
-                                    break;
-                                }
+                                    _ = check_interval.tick() => {
+                                        let should_run = {
+                                            let state = bot_state.lock().await;
+                                            state.is_running
+                                        };
 
-                                // Always wait for the check interval
-                                check_interval.tick().await;
-
-                                // Execute strategy with timeout protection
-                                match tokio::time::timeout(
-                                    Duration::from_secs(60), // Timeout after 60 seconds
-                                    trading_bot.execute_strategy(
-                                        bot_state.clone(),
-                                        bot.clone(),
-                                        chat_id,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(_)) => {
-                                        // Strategy execution completed
-                                        // successfully
-                                    }
-                                    Ok(Err(e)) => {
-                                        let error_msg = format!("Strategy execution failed: {}", e);
-                                        eprintln!("{}", &error_msg);
-
-                                        // Send error message
-                                        if let Err(e) = bot.send_message(chat_id, &error_msg).await
-                                        {
-                                            eprintln!("Error sending error message: {}", e);
+                                        if !should_run {
+                                            println!("Stop flag detected, shutting down bot");
+                                            if let Err(e) = bot
+                                                .send_message(chat_id, "Trading bot has been stopped.")
+                                                .await
+                                            {
+                                                eprintln!("Error sending stop message: {}", e);
+                                            }
+                                            break;
                                         }
 
-                                        // Send message about restarting the bot
-                                        if let Err(e) = bot
-                                            .send_message(
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(60),
+                                            trading_bot.execute_strategy(
+                                                bot_state.clone(),
+                                                bot.clone(),
                                                 chat_id,
-                                                "Stopping and restarting the bot due to error...",
-                                            )
-                                            .await
+                                            ),
+                                        )
+                                        .await
                                         {
-                                            eprintln!("Error sending restart message: {}", e);
-                                        }
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(e)) => {
+                                                let error_msg = format!("Strategy execution failed: {}", e);
+                                                eprintln!("{}", &error_msg);
 
-                                        // Briefly stop the bot
-                                        {
-                                            let mut state = bot_state.lock().await;
-                                            state.is_running = false;
-                                        }
+                                                if let Err(e) = bot.send_message(chat_id, &error_msg).await {
+                                                    eprintln!("Error sending error message: {}", e);
+                                                }
 
-                                        // Wait a moment before restarting
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
-
-                                        // Restart the bot
-                                        {
-                                            let mut state = bot_state.lock().await;
-                                            state.is_running = true;
-                                        }
-
-                                        // Send confirmation of restart
-                                        if let Err(e) = bot
-                                            .send_message(chat_id, "Bot has been restarted.")
-                                            .await
-                                        {
-                                            eprintln!(
-                                                "Error sending restart confirmation message: {}",
-                                                e
-                                            );
-                                        }
-
-                                        // Re-initialize the bot with a fresh instance
-                                        match T::new().await {
-                                            Ok(new_bot) => {
-                                                trading_bot = new_bot; // Replace with the new instance
                                                 if let Err(e) = bot
                                                     .send_message(
                                                         chat_id,
-                                                        "Trading bot has been re-initialized.",
+                                                        "Stopping and restarting the bot due to error...",
                                                     )
                                                     .await
                                                 {
-                                                    eprintln!(
-                                                        "Error sending re-initialization message: \
-                                                         {}",
-                                                        e
-                                                    );
+                                                    eprintln!("Error sending restart message: {}", e);
                                                 }
-                                            }
-                                            Err(e) => {
-                                                let init_error_msg =
-                                                    format!("Failed to re-initialize bot: {}", e);
-                                                eprintln!("{}", &init_error_msg);
 
-                                                if let Err(e) =
-                                                    bot.send_message(chat_id, &init_error_msg).await
+                                                {
+                                                    let mut state = bot_state.lock().await;
+                                                    state.is_running = false;
+                                                }
+
+                                                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                                                {
+                                                    let mut state = bot_state.lock().await;
+                                                    state.is_running = true;
+                                                }
+
+                                                if let Err(e) = bot
+                                                    .send_message(chat_id, "Bot has been restarted.")
+                                                    .await
                                                 {
                                                     eprintln!(
-                                                        "Error sending re-initialization error \
-                                                         message: {}",
+                                                        "Error sending restart confirmation message: {}",
                                                         e
                                                     );
                                                 }
 
-                                                // Set the bot to stopped state
-                                                let mut state = bot_state.lock().await;
-                                                state.is_running = false;
+                                                match T::new().await {
+                                                    Ok(new_bot) => {
+                                                        let interval_seconds =
+                                                            new_bot.get_interval_seconds();
+                                                        let config_path =
+                                                            new_bot.get_config_path().to_string();
+
+                                                        {
+                                                            let mut state = bot_state.lock().await;
+                                                            state.config_path = Some(config_path);
+                                                            state.interval_seconds = Some(interval_seconds);
+                                                        }
+
+                                                        trading_bot = new_bot;
+                                                        check_interval = tokio::time::interval(
+                                                            Duration::from_secs(interval_seconds),
+                                                        );
+                                                        check_interval.tick().await;
+                                                        if let Err(e) = bot
+                                                            .send_message(
+                                                                chat_id,
+                                                                "Trading bot has been re-initialized.",
+                                                            )
+                                                            .await
+                                                        {
+                                                            eprintln!(
+                                                                "Error sending re-initialization message: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let init_error_msg =
+                                                            format!("Failed to re-initialize bot: {}", e);
+                                                        eprintln!("{}", &init_error_msg);
+
+                                                        if let Err(e) =
+                                                            bot.send_message(chat_id, &init_error_msg).await
+                                                        {
+                                                            eprintln!(
+                                                                "Error sending re-initialization error message: {}",
+                                                                e
+                                                            );
+                                                        }
+
+                                                        let mut state = bot_state.lock().await;
+                                                        state.is_running = false;
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                println!("Strategy execution timed out");
                                             }
                                         }
-                                    }
-                                    Err(_) => {
-                                        println!("Strategy execution timed out");
-                                        // You might want to send a message or
-                                        // handle the timeout
-                                        // differently
                                     }
                                 }
                             }
@@ -599,6 +666,64 @@ impl<T: TradingBot> TelegramBotHandler<T> {
 }
 
 /// Create a helper function for sending messages
+const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+const PRE_WRAP_OVERHEAD: usize = "<pre></pre>".len();
+
+fn split_message_chunks(message: &str, max_len: usize) -> Vec<String> {
+    if message.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for segment in message.split_inclusive('\n') {
+        let seg_len = segment.chars().count();
+
+        if current_len + seg_len <= max_len {
+            current.push_str(segment);
+            current_len += seg_len;
+            continue;
+        }
+
+        if !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+
+        if seg_len <= max_len {
+            current.push_str(segment);
+            current_len = seg_len;
+        } else {
+            let mut buffer = String::new();
+            let mut buffer_len = 0usize;
+
+            for ch in segment.chars() {
+                if buffer_len == max_len {
+                    chunks.push(buffer);
+                    buffer = String::new();
+                    buffer_len = 0;
+                }
+
+                buffer.push(ch);
+                buffer_len += 1;
+            }
+
+            if !buffer.is_empty() {
+                current = buffer;
+                current_len = buffer_len;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
+
 pub async fn send_telegram_notification(
     bot: &Bot,
     chat_id: ChatId,
@@ -608,18 +733,26 @@ pub async fn send_telegram_notification(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Only send if the message level is important enough
     if level_is_sufficient(level, current_level) {
-        let mono_message = format!("<pre>{}</pre>", message);
-        match bot
-            .send_message(chat_id, mono_message)
-            .parse_mode(ParseMode::Html)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
+        let max_payload_len = TELEGRAM_MAX_MESSAGE_LENGTH.saturating_sub(PRE_WRAP_OVERHEAD);
+        let chunks = split_message_chunks(&message, max_payload_len);
+
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in chunks {
+            let mono_message = format!("<pre>{}</pre>", chunk);
+            if let Err(e) = bot
+                .send_message(chat_id, mono_message)
+                .parse_mode(ParseMode::Html)
+                .await
+            {
                 eprintln!("Failed to send Telegram message: {}", e);
-                Err(Box::new(BotError(format!("Telegram error: {}", e))))
+                return Err(Box::new(BotError(format!("Telegram error: {}", e))));
             }
         }
+
+        Ok(())
     } else {
         Ok(())
     }

@@ -83,7 +83,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         bot_state,
         bot,
         chat_id,
-        300, // Check interval in seconds
     ).await?;
 
     Ok(())
