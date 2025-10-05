@@ -25,11 +25,15 @@ pub trait TradingBot: Send + Sync {
 
     /// Initializes a new trading bot instance.
     ///
+    /// # Arguments
+    ///
+    /// * `interval_seconds` - The interval in seconds between strategy executions
+    ///
     /// # Returns
     ///
     /// * `Ok(Self)` when the bot is successfully created
     /// * `Err(Self::Error)` if initialization fails
-    async fn new() -> Result<Self, Self::Error>
+    async fn new(interval_seconds: u64) -> Result<Self, Self::Error>
     where
         Self: Sized;
 
@@ -51,19 +55,6 @@ pub trait TradingBot: Send + Sync {
         telegram_bot: Bot,
         chat_id: ChatId,
     ) -> Result<(), Self::Error>;
-
-    /// Retrieves a human-readable status summary of the bot.
-    ///
-    /// # Returns
-    ///
-    /// A `String` describing the bot's current state and key metrics.
-    async fn get_status(&self) -> String;
-
-    /// Returns the file path for the symbols configuration.
-    fn get_config_path(&self) -> &str;
-
-    /// Returns the interval, in seconds, between strategy executions.
-    fn get_interval_seconds(&self) -> u64;
 }
 
 /// Configuration manager trait for handling symbol configurations

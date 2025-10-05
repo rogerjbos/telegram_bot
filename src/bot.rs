@@ -49,8 +49,8 @@ impl Default for BotState {
         Self {
             is_running: false,
             notification_level: NotificationLevel::Important,
-            config_path: None,
-            interval_seconds: None,
+            config_path: Some("symbols_config.json".to_string()),
+            interval_seconds: Some(300),
         }
     }
 }
@@ -465,6 +465,7 @@ impl TelegramBotHandler {
         bot: Bot,
         chat_id: ChatId,
         mut request_rx: mpsc::UnboundedReceiver<BotRequest>,
+        interval_seconds: u64,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Spawn the bot in a new thread to avoid Send issues
         std::thread::spawn(move || {
@@ -474,16 +475,12 @@ impl TelegramBotHandler {
                 .unwrap()
                 .block_on(async move {
                     // Try to initialize the bot
-                    let init_result = T::new().await;
+                    let init_result = T::new(interval_seconds).await;
 
                     match init_result {
                         Ok(mut trading_bot) => {
-                            let interval_seconds = trading_bot.get_interval_seconds();
-                            let config_path = trading_bot.get_config_path().to_string();
-
                             {
                                 let mut state = bot_state.lock().await;
-                                state.config_path = Some(config_path);
                                 state.interval_seconds = Some(interval_seconds);
                             }
 
@@ -509,7 +506,7 @@ impl TelegramBotHandler {
                                     maybe_request = request_rx.recv() => {
                                         match maybe_request {
                                             Some(BotRequest::GetStatus(response_tx)) => {
-                                                let status = trading_bot.get_status().await;
+                                                let status = "Bot is running. Use /update for detailed status.".to_string();
                                                 let _ = response_tx.send(Ok(status));
                                             }
                                             None => {
@@ -586,16 +583,10 @@ impl TelegramBotHandler {
                                                     );
                                                 }
 
-                                                match T::new().await {
+                                                match T::new(interval_seconds).await {
                                                     Ok(new_bot) => {
-                                                        let interval_seconds =
-                                                            new_bot.get_interval_seconds();
-                                                        let config_path =
-                                                            new_bot.get_config_path().to_string();
-
                                                         {
                                                             let mut state = bot_state.lock().await;
-                                                            state.config_path = Some(config_path);
                                                             state.interval_seconds = Some(interval_seconds);
                                                         }
 
